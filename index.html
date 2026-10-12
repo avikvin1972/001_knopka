@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Исчезающая кнопка</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; align-items: center; justify-content: center; background: #f4f4f6; font-family: system-ui, sans-serif; color: #222; }
+  #btn { font-size: 22px; padding: 22px 44px; border: 0; border-radius: 14px; background: #3b6fe0; color: #fff; cursor: pointer; touch-action: manipulation; user-select: none; }
+  #btn.gone { visibility: hidden; pointer-events: none; }  /* место кнопки остаётся, она просто невидима и не нажимается */
+  #status { position: fixed; left: 0; right: 0; bottom: 10px; text-align: center; font-size: 12px; color: #888; white-space: pre-line; padding: 0 8px; }
+  #video { position: fixed; left: 10px; top: 10px; width: 96px; border-radius: 6px; opacity: .5; transform: scaleX(-1); display: none; }
+</style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline muted></video>
+<button id="btn">Нажми</button>
+<div id="status">Нажми кнопку — включится камера</div>
+
+<script>
+/* =====================================================================
+   ЯДРО: один нейрон. Те же функции, что раньше, но входов теперь больше:
+     192 пикселя кадра (чёрно-белый, нормированный)
+   + 192 числа «где в кадре что-то движется» (разница с кадром 0,3 с назад)
+   +   3 общих числа (яркость, контрастность, сколько всего движется).
+   Тянущаяся рука — это ДВИЖЕНИЕ, а рука, просто державшая планшет, неподвижна.
+   ===================================================================== */
+const W = 16, H = 12, N = W * H;
+const D = 2 * N + 3;               // всего входов нейрона
+
+function sigmoid(z) {
+  if (z > 30) z = 30;
+  if (z < -30) z = -30;
+  return 1 / (1 + Math.exp(-z));
+}
+
+// Нормировка кадра: вычитаем среднюю яркость, делим на разброс.
+// Нижний предел разброса (0.03) нужен, чтобы почти однотонный кадр
+// (например, камера закрыта пальцем) не превращался в усиленный шум.
+function normalize(gray) {
+  let mean = 0;
+  for (let i = 0; i < gray.length; i++) mean += gray[i];
+  mean /= gray.length;
+  let variance = 0;
+  for (let i = 0; i < gray.length; i++) { const d = gray[i] - mean; variance += d * d; }
+  const std = Math.max(Math.sqrt(variance / gray.length), 0.03);
+  const x = new Float32Array(gray.length);
+  for (let i = 0; i < gray.length; i++) x[i] = (gray[i] - mean) / std;
+  return x;
+}
+
+// Все входы нейрона из текущего кадра и кадра ~0,3 с назад.
+function features(gray, prev) {
+  const x = new Float32Array(D);
+  const a = normalize(gray);
+  let mean = 0, mot = 0;
+  for (let i = 0; i < N; i++) {
+    x[i] = a[i];
+    const m = Math.abs(gray[i] - prev[i]);
+    x[N + i] = Math.min(3, m * 12);          // движение в этой точке
+    mean += gray[i];
+    mot += m;
+  }
+  mean /= N; mot /= N;
+  let v = 0;
+  for (let i = 0; i < N; i++) { const d = gray[i] - mean; v += d * d; }
+  const sd = Math.sqrt(v / N);
+  x[2 * N]     = 3 * (mean - 0.5) * 4;                 // общая яркость
+  x[2 * N + 1] = 3 * (sd - 0.15) * 10;                 // контрастность
+  x[2 * N + 2] = 3 * (Math.min(3, mot * 12) - 0.3);    // сколько всего движется
+  return x;
+}
+
+function newModel() {
+  const weights = new Float32Array(D);
+  for (let i = 0; i < D; i++) weights[i] = (Math.random() - 0.5) * 0.02;
+  return { weights: weights, bias: 0 };
+}
+
+// p = «уверенность, что рука тянется к кнопке»
+function predict(model, x) {
+  let z = model.bias;
+  for (let i = 0; i < D; i++) z += model.weights[i] * x[i];
+  return sigmoid(z);
+}
+
+// Эпоха обучения. wPos — во сколько раз «важнее» пример класса 1.
+// Небольшое затухание весов не даёт им разрастаться.
+function trainEpoch(model, samples, lr, wPos) {
+  const order = [];
+  for (let i = 0; i < samples.length; i++) order.push(i);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = order[i]; order[i] = order[j]; order[j] = t;
+  }
+  for (let k = 0; k < order.length; k++) {
+    const s = samples[order[k]];
+    const p = predict(model, s.x);
+    const d = (p - s.y) * (s.y === 1 ? wPos : 1);
+    for (let i = 0; i < D; i++) {
+      model.weights[i] -= lr * (d * s.x[i] + 0.01 * model.weights[i]);
+    }
+    model.bias -= lr * d;
+  }
+}
+
+/* =====================================================================
+   ЛОГИКА ПРИЛОЖЕНИЯ
+   ===================================================================== */
+
+const PRE_MS = 800;        // кадры за столько мс ДО нажатия считаются «рука тянется»
+const AGE_MS = 3000;       // кадр «созревает» через столько мс и тогда получает метку «спокойно»
+const AMBIG_MS = 2000;     // кадры в ±2 с от нажатия не берём в «спокойно» (рука могла быть рядом)
+const NEG_EVERY = 3;       // из «спокойных» кадров берём каждый 3-й
+const NEG_MAX = 400;       // сколько «спокойных» примеров хранить максимум
+const HITS_NEEDED = 3;     // сколько нажатий подряд сеть должна угадать заранее
+const NEG_WINDOW = 30;     // по скольким последним «спокойным» кадрам считаем ложные срабатывания
+const MAX_HIDDEN_MS = 4000;// кнопка не может быть скрыта дольше: так сеть не заблокирует кнопку насовсем
+
+const btn = document.getElementById('btn');
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status');
+
+const small = document.createElement('canvas');
+small.width = W; small.height = H;
+const smallCtx = small.getContext('2d', { willReadFrequently: true });
+
+let camOn = false;
+let model = newModel();
+let modelReady = false;    // сеть хоть раз обучалась
+let trained = false;       // сеть доказала, что угадывает; с этого момента кнопка исчезает
+let samples = [];
+let posCount = 0, negCount = 0;
+let clicks = [];           // времена нажатий
+let buffer = [];           // последние кадры: {t, x, hid}
+let history = [];          // последние чёрно-белые кадры (для движения)
+let negTick = 0;
+let negHist = [];          // последние ответы сети на «спокойных» кадрах (true = верно, не сработала)
+let negSinceTrain = 0;
+let streak = 0;            // сколько нажатий подряд сеть угадала заранее
+let hidden = false;
+let hiddenSince = 0;
+let holdoffUntil = 0;      // до этого момента кнопку не прячем
+let hiCount = 0, loCount = 0;
+let lastP = 0;
+let note = '';
+
+// Кадр камеры -> 192 яркости (0..1)
+function grabGray() {
+  smallCtx.drawImage(video, 0, 0, W, H);
+  const data = smallCtx.getImageData(0, 0, W, H).data;
+  const gray = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    gray[i] = (0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]) / 255;
+  }
+  return gray;
+}
+
+function fractionHit(frames) {
+  let hit = 0;
+  for (const f of frames) if (predict(model, f.x) >= 0.5) hit++;
+  return hit / frames.length;
+}
+
+// Доля «спокойных» кадров, на которых сеть НЕ сработала (по кадрам, которых она ещё не видела).
+function negRate() {
+  if (negHist.length === 0) return 0;
+  let ok = 0;
+  for (const v of negHist) if (v) ok++;
+  return ok / negHist.length;
+}
+
+function checkTrained() {
+  if (trained || !modelReady) return;
+  const enough = negHist.length >= 15;
+  const r = negRate();
+  // Обычный путь: 3 угаданных подряд и не более 15% ложных срабатываний.
+  if (streak >= HITS_NEEDED && enough && r >= 0.85) trained = true;
+  // Запасной путь, если «ложные» никак не уходят: долгая серия угаданных и не более 30% ложных.
+  else if (streak >= 8 && clicks.length >= 14 && enough && r >= 0.7) trained = true;
+}
+
+function retrain() {
+  if (posCount < 2 || negCount < 20) return;
+  const wPos = Math.max(1, Math.min(5, negCount / posCount));
+  for (let e = 0; e < 40; e++) trainEpoch(model, samples, 0.002, wPos);
+  modelReady = true;
+  negSinceTrain = 0;
+}
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    video.style.display = 'block';
+    camOn = true;
+  } catch (e) {
+    note = 'Не удалось включить камеру: ' + e.message + '. Открой страницу с компьютера/телефона по https (или localhost) и разреши камеру.';
+    render();
+  }
+}
+
+// Нажатие. Первое включает камеру, остальные — обучающие события.
+btn.addEventListener('click', async () => {
+  if (!camOn) { await startCamera(); render(); return; }
+
+  const now = performance.now();
+  clicks.push(now);
+
+  // Кадры последних PRE_MS миллисекунд — это и есть «рука тянется к кнопке».
+  const frames = buffer.filter(f => f.t >= now - PRE_MS);
+  if (frames.length === 0) return;
+
+  // Честная проверка: пока сеть НЕ видела эти кадры, угадала ли она событие?
+  if (modelReady) {
+    const ok = fractionHit(frames) >= 0.5;
+    streak = ok ? streak + 1 : 0;
+  }
+
+  for (const f of frames) { samples.push({ x: f.x, y: 1 }); posCount++; }
+  retrain();
+  checkTrained();
+  render();
+});
+
+// Кадры, которые «повзрослели» (прошло AGE_MS), получают метку «спокойно» —
+// если рядом по времени не было нажатия.
+function processBuffer(now) {
+  while (buffer.length && now - buffer[0].t > AGE_MS) {
+    const f = buffer.shift();
+    if (trained || f.hid) continue;                       // когда кнопка уже исчезает, «спокойных» не собираем
+    if (clicks.some(c => c >= f.t - AMBIG_MS && c <= f.t + AMBIG_MS)) continue;
+    negTick++;
+    if (negTick % NEG_EVERY !== 0) continue;
+    if (modelReady) {
+      negHist.push(predict(model, f.x) < 0.5);
+      if (negHist.length > NEG_WINDOW) negHist.shift();
+    }
+    samples.push({ x: f.x, y: 0 });
+    negCount++;
+    negSinceTrain++;
+    if (negCount > NEG_MAX) {                             // выкидываем случайный старый «спокойный» пример
+      for (let tries = 0; tries < 50; tries++) {
+        const idx = Math.floor(Math.random() * samples.length);
+        if (samples[idx].y === 0) { samples.splice(idx, 1); negCount--; break; }
+      }
+    }
+  }
+  // Подучиваем и на новых «спокойных» кадрах, даже если нажатий давно не было.
+  if (!trained && negSinceTrain >= 25) { retrain(); checkTrained(); }
+}
+
+function setHidden(v, now) {
+  hidden = v;
+  hiddenSince = now;
+  btn.classList.toggle('gone', v);
+}
+
+function render() {
+  if (note) { statusEl.textContent = note; return; }
+  if (!camOn) { statusEl.textContent = 'Нажми кнопку — включится камера'; return; }
+  let state;
+  if (trained) {
+    state = 'обучена: кнопка прячется от руки';
+  } else if (modelReady) {
+    const fa = negHist.length ? Math.round((1 - negRate()) * 100) + '%' : '—';
+    state = 'учусь: угадала подряд ' + streak + ' из ' + HITS_NEEDED + ', ложных срабатываний на покое ' + fa +
+      (negHist.length < 15 ? '\n(делай паузы 4–5 секунд между нажатиями, руку убирай из кадра)' : '');
+  } else {
+    state = 'собираю примеры: жми с паузами 4–5 секунд, руку между нажатиями убирай из кадра';
+  }
+  statusEl.textContent =
+    'нажатий: ' + clicks.length + ' · примеров «тянется»: ' + posCount + ', «спокойно»: ' + negCount +
+    '\n' + state + (modelReady ? ' · p=' + lastP.toFixed(2) : '');
+}
+
+// Основной цикл: 10 кадров в секунду
+setInterval(() => {
+  if (!camOn || video.readyState < 2) return;
+  const now = performance.now();
+  const gray = grabGray();
+
+  history.push(gray);
+  if (history.length > 4) history.shift();
+  const x = features(gray, history[0]);          // history[0] — кадр примерно 0,3 с назад
+
+  lastP = modelReady ? predict(model, x) : 0;
+
+  // Кнопка скрывается, когда сеть уверена, что рука тянется; возвращается, когда рука убрана.
+  if (trained) {
+    if (lastP > 0.7) { hiCount++; loCount = 0; }
+    else if (lastP < 0.35) { loCount++; hiCount = 0; }
+    if (!hidden && hiCount >= 2 && now >= holdoffUntil) setHidden(true, now);
+    else if (hidden && loCount >= 6) setHidden(false, now);
+    // Предохранитель: если кнопка прячется слишком долго, возвращаем её принудительно.
+    if (hidden && now - hiddenSince > MAX_HIDDEN_MS) {
+      setHidden(false, now);
+      holdoffUntil = now + 2500;
+      hiCount = 0;
+    }
+  }
+
+  buffer.push({ t: now, x: x, hid: hidden });
+  processBuffer(now);
+  render();
+}, 100);
+
+render();
+</script>
+</body>
+</html>
